@@ -21,6 +21,7 @@ class FileDistributedClient
     private $table;
     private $cur_address;
     private $del_server = array();
+    private $flagclient;
     public function __construct()
     {
         require_once __DIR__ . '/lib/phpredis.php';
@@ -33,11 +34,6 @@ class FileDistributedClient
     public function addServerClient($address)
     {
         $client = new swoole_client(SWOOLE_TCP, SWOOLE_SOCK_ASYNC);
-        /*$client->set(array(
-        'socket_buffer_size' => 1024 * 1024 * 2,
-        'open_eof_check' => true,
-        'package_eof' => "\r\n\r\n",
-        ));*/
         $client->on('Connect', array(
             &$this,
             'onConnect'
@@ -66,23 +62,109 @@ class FileDistributedClient
     public function onConnect($serv)
     {
         $localinfo = swoole_get_local_ip();
-        $serv->send(json_encode(array(
+        $serv->send($this->packmes(array(
             'type' => 'system',
             'data' => array(
                 'code' => 10001,
                 'status' => 1,
-                'fd' => $localinfo['eth0']
+                'fd' => current($localinfo)
             )
         )));
     }
     
     public function onReceive($client, $data)
     {
-        $remote_info = json_decode($data, true);
-        if ($remote_info['type'] == 'filemes') {
-            if ($client->sendfile($remote_info['data']['path'])) {
+        $remote_info = $this->unpackmes($data);
+        if (is_array($remote_info)) {
+            foreach ($remote_info as &$val) {
+                switch ($val['type']) {
+                    case 'filemes':
+                        $strlendata = file_get_contents(LISTENPATH . '/' . rawurldecode($val['data']['path']));
+                        $datas      = array(
+                            'type' => 'filesize',
+                            'data' => array(
+                                'path' => $val['data']['path'],
+                                'filesize' => strlen($strlendata)
+                            )
+                        );
+                        $client->send($this->packmes($datas));
+                        break;
+                    case 'filesizemes':
+                        if ($client->sendfile(LISTENPATH . '/' . rawurldecode($val['data']['path']))) {
+                        }
+                        break;
+                    case 'system': //启动一个进程来处理已存在的图片
+                        $listenpath       = LISTENPATH;
+                        $this->flagclient = $flagclient = 0;
+                        $process = new swoole_process(function($process) use ($listenpath, $flagclient)
+                        {
+                            if (!$flagclient) {
+                                $filelist = $this->getlistDirFile($listenpath);
+                                if (!empty($filelist)) {
+                                    foreach ($filelist as &$v) {
+                                        $process->write($v);
+                                    }
+                                    $flagclient = 1;
+                                }
+                            }
+                            
+                        });
+                        $process->start();
+                        swoole_event_add($process->pipe, function($pipe) use ($client, $listenpath, $process)
+                        {
+                            $data_l = $process->read();
+                            $extends = explode("/", $data_l);
+                            $vas     = count($extends) - 1;
+                            $pre_dir = substr($data_l, 0, strripos($data_l, "/") + 1);
+                            if ($pre_dir == $listenpath) {
+                                $data = array(
+                                    'type' => 'asyncfileclient',
+                                    'data' => array(
+                                        //'path' => iconv('GB2312', 'UTF-8', $data_l),
+                                        'path' => rawurlencode($data_l),
+                                        'fileex' => rawurlencode($extends[$vas]),
+                                        'pre' => ''
+                                    )
+                                );
+                            } else {
+                                $data = array(
+                                    'type' => 'asyncfileclient',
+                                    'data' => array(
+                                        'path' => rawurlencode($data_l),
+                                        'fileex' => rawurlencode($extends[$vas]),
+                                        'pre' => rawurlencode(substr($pre_dir, strlen($listenpath) + 1, strlen($pre_dir)))
+                                    )
+                                );
+                            }
+                            
+                            
+                            $client->send($this->packmes($data));
+                        });
+                        break;
+                    case 'asyncfile':
+                        $data_sa = array(
+                            'type' => 'file',
+                            'data' => array(
+                                'path' => $val['data']['path']
+                            )
+                        );
+                        
+                        $client->send($this->packmes($data_sa));
+                        break;
+                    default:
+                        break;
+                        
+                        
+                }
             }
+            
+            
+        } else {
+            echo date('[ c ]') . '参数不对 \r\n';
         }
+        
+        
+        
     }
     public function onTask($serv, $task_id, $from_id, $data)
     {
@@ -154,6 +236,66 @@ class FileDistributedClient
     public function delkey($keyname = 'errserfile')
     {
         return dredis::getInstance()->delkey($keyname);
+    }
+    //获取目录
+    public function getlistDir($dir)
+    {
+        $dir .= substr($dir, -1) == '/' ? '' : '/';
+        $dirInfo = array();
+        foreach (glob($dir . '*', GLOB_ONLYDIR) as $v) {
+            $dirInfo[] = $v;
+            if (is_dir($v)) {
+                $dirInfo = array_merge($dirInfo, $this->getlistDir($v));
+            }
+        }
+        return $dirInfo;
+    }
+    //解包装数据
+    public function unpackmes($data, $format = '\r\n\r\n')
+    {
+        $pos = strpos($data, $format);
+        if ($pos !== false) {
+            $tmpdata = explode($format, $data);
+            foreach ($tmpdata as $k => $v) {
+                if (empty($v)) {
+                    unset($tmpdata[$k]);
+                } else {
+                    $tmpdata[$k] = json_decode($v, true);
+                }
+            }
+            return $tmpdata;
+        } else {
+            return $data;
+        }
+    }
+    //包装数据
+    public function packmes($data, $format = '\r\n\r\n')
+    {
+        return json_encode($data, true) . $format;
+    }
+    //获取目录文件
+    public function getlistDirFile($dir)
+    {
+        $dir .= substr($dir, -1) == '/' ? '' : '/';
+        $dirInfo = array();
+        foreach (glob($dir . '*') as $v) {
+            if (!is_dir($v)) {
+                $dirInfo[] = $v;
+            }
+            if (is_dir($v)) {
+                $dirInfo = array_merge($dirInfo, $this->getlistDirFile($v));
+            }
+        }
+        return $dirInfo;
+    }
+    //创建目录
+    public function mklistDir($dir)
+    {
+        if (is_dir($dir) && is_readable($dir)) {
+            $this->mklistDir(dirname($dir));
+        } else {
+            mkdir($dir, 0777, true);
+        }
     }
     //定时获取移除的服务器
     public function geterrlist($data)
